@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sets up ecs cluster
+Parameters:
+  ClusterName:
+    Type: String
+
+  ECSInstanceTypeWeb:
+    Type: String
+
+  ECSInstanceBastionType:
+    Type: String
+
+  ECSInstanceTypeWorker:
+    Type: String
+    Default: "t2.micro"
+
+  KeyName:
+    Type: String
+  
+  # web configuration
+  AsgServiceMinWeb:
+    Type: String
+
+  AsgServiceDesiredWeb:
+    Type: String
+
+  AsgServiceMaxWeb:
+    Type: String
+
+  # worker configuration
+  # AsgServiceMinWorker:
+  #   Type: String
+  #   Default: "2"
+
+  # AsgServiceDesiredWorker:
+  #   Type: String
+  #   Default: "4"
+
+  # AsgServiceMaxWorker:
+  #   Type: String
+  #   Default: "8"
+
+  S3Bucket:
+    Type: String
+
+  TypeProject:
+    Type: String
+
+  EcsImage:
+    Type: String
+
+  BastionImage:
+    Type: String
+
+  HostedZoneName:
+    Type: String
+
+  LogRetentionDays:
+    Type: String
+    Default: "14"
+
+  ESDomainName:
+    Type: String
+    Default: es-alpenspruce
+
+  SpotPrice:
+    Type: String
+    Default: "0.026"
+
+  WebScaleOutPolicyCooldown:
+    Type: String
+    Default: "1"
+
+  WebScaleInPolicyCooldown:
+    Type: String
+    Default: "1"
+
+  # WorkerScaleOutPolicyCooldown:
+  #   Type: String
+  #   Default: "300"
+
+  # WorkerScaleInPolicyCooldown:
+  #   Type: String
+  #   Default: "300"
+      
+  ### CapacityAutoScalingGroup
+  TargetCapacity:
+    Description:  TargetCapacity
+    Type: Number
+    Default: 100
+
+  CapacityAsgServiceMin:
+    Description: ASG minimum instances
+    Type: Number
+    Default: 2
+
+  CapacityAsgServiceDesired:
+    Description: ASG desired instances
+    Type: Number
+    Default: 2
+
+  CapacityAsgServiceMax:
+    Description: ASG maximum instances
+    Type: Number
+    Default: 20
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs-cluster/${ClusterName}
+      RetentionInDays: !Ref LogRetentionDays
+
+  LambdaInvoke:
+    DependsOn: LogGroup
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName:
+        'Fn::ImportValue': !Sub "lambda-consumer-${ESDomainName}"
+      Action: "lambda:InvokeFunction"
+      Principal: !Join [ "", ["logs.", !Ref "AWS::Region", ".amazonaws.com"]]
+      SourceAccount:
+        Ref: AWS::AccountId
+      SourceArn:
+        !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs-cluster/${ClusterName}:*
+  Filter:
+    DependsOn: LambdaInvoke
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName:
+        !Sub /ecs-cluster/${ClusterName}
+      FilterPattern: ""
+      DestinationArn:
+        'Fn::ImportValue': !Sub "lambda-consumer-${ESDomainName}-arn"
+
+#========== Roles
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::Region}-${ClusterName}_EC2Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+      InstanceProfileName: !Sub ${AWS::Region}-${ClusterName}_EC2InstanceProfile
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::Region}-${ClusterName}_ECSRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'ecs.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole'
+
+#========== Security Groups
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      GroupName: !Sub ${ClusterName}AllowSSH
+      GroupDescription: Enables access to all IPs to port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: -1
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.20.0.0/20
+
+#========== ECS
+  PrivateNameSpace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Description: !Sub Private Name for Cluster ${ClusterName}
+      Vpc:
+        'Fn::ImportValue': !Sub ${ClusterName}VPC
+      Name: !Sub ${ClusterName}.internal
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ClusterName}
+
+#========== EC2
+  BastionEIP:
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: vpc
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName} bastion
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref BastionSecurityGroup
+            - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+          SubnetId:
+            'Fn::ImportValue': !Sub ${ClusterName}PublicSubnet1
+      ImageId: !Ref EcsImage
+      ImageId: !Ref BastionImage
+      InstanceType: !Ref ECSInstanceBastionType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+
+  BastionAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt BastionEIP.AllocationId
+      InstanceId: !Ref BastionInstance
+
+  BastionDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}
+      RecordSets:
+        - Name: !Sub ${ClusterName}-bastion.${HostedZoneName}
+          Type: A
+          TTL: 5
+          ResourceRecords:
+            - !Ref BastionEIP
+            
+  SsmBastionIp:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ClusterName}/RDS/BASTION
+      Value: !Sub ${BastionInstance.PublicIp}
+      Type: String
+
+#========== Application Launch Configuration
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !Ref KeyName
+      ImageId: !Ref EcsImage
+      SecurityGroups:
+        - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+      InstanceType: !Ref ECSInstanceTypeWeb
+      AssociatePublicIpAddress: false
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: '100'
+        - DeviceName: "/dev/xvdcz"
+          Ebs:
+            VolumeSize: '100'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          #====== Resize EBS
+            resize2fs /dev/xvda
+            resize2fs /dev/xvdcz
+
+          #====== Install SSM
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+            start amazon-ssm-agent
+            chkconfig amazon-ssm-agent on
+
+          #====== Install AWSLOGS
+            yum install -y awslogs
+            mv /etc/awslogs/awslogs.conf /etc/awslogs/awslogs.conf.bkp
+            aws s3 cp s3://${S3Bucket}/cloudformation/${TypeProject}/awslogs.conf /etc/awslogs/awslogs.conf
+            sed -i "s/us-east-1/${AWS::Region}/g" /etc/awslogs/awscli.conf
+            sed -i "s/clustername/${ECSCluster}/g" /etc/awslogs/awslogs.conf
+            sed -i "s/instanceID/`curl -s http://169.254.169.254/latest/meta-data/instance-id`/g" /etc/awslogs/awslogs.conf
+            service awslogs start
+            chkconfig awslogs on
+
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+          echo ECS_INSTANCE_ATTRIBUTES={\"cluster_type\":\"web\"} >> /etc/ecs/ecs.config
+
+  # AutoScalingGroup:
+  #   Type: AWS::AutoScaling::AutoScalingGroup
+  #   Properties:
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${ClusterName} cluster
+  #         PropagateAtLaunch: true
+  #     LaunchConfigurationName: !Ref LaunchConfiguration
+  #     MinSize: !Ref AsgServiceMinWeb
+  #     DesiredCapacity: !Ref AsgServiceDesiredWeb
+  #     MaxSize: !Ref AsgServiceMaxWeb
+  #     TargetGroupARNs:
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}BackendAlbDefaultTargetGroup
+  #     VPCZoneIdentifier:
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet1
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet2
+  #   UpdatePolicy:
+  #     AutoScalingRollingUpdate:
+  #       MaxBatchSize: '1'
+  #       MinInstancesInService: !Ref AsgServiceDesiredWeb
+  #       PauseTime: 'PT5M'
+
+  AutoScalingGroupCP:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ClusterName} cluster
+          PropagateAtLaunch: true
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref CapacityAsgServiceMin
+      DesiredCapacity: !Ref CapacityAsgServiceDesired
+      MaxSize: !Ref CapacityAsgServiceMax
+      TargetGroupARNs:
+        - 'Fn::ImportValue': !Sub ${ClusterName}BackendAlbDefaultTargetGroup
+      VPCZoneIdentifier:
+        - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet1
+        - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet2
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: '1'
+        MinInstancesInService: !Ref AsgServiceDesiredWeb
+        PauseTime: 'PT5M'
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub ${ClusterName}-CapacityProvider
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroupCP
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: !Ref TargetCapacity
+
+  ClusterCapacityProviderAssociations:
+    DependsOn: [ CapacityProvider ]
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      CapacityProviders:
+        - !Sub ${ClusterName}-CapacityProvider
+      Cluster: !Sub ${ClusterName}
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Sub ${ClusterName}-CapacityProvider
+
+#========== Worker Launch Configuration
+  # WorkerLaunchConfiguration:
+  #   Type: AWS::AutoScaling::LaunchConfiguration
+  #   Properties:
+  #     IamInstanceProfile: !Ref EC2InstanceProfile
+  #     SpotPrice: !Ref SpotPrice
+  #     KeyName: !Ref KeyName
+  #     ImageId: !Ref EcsImage
+  #     SecurityGroups:
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}InternalAccessSecurityGroup
+  #     InstanceType: !Ref ECSInstanceTypeWorker
+  #     AssociatePublicIpAddress: false
+  #     BlockDeviceMappings:
+  #       - DeviceName: "/dev/xvda"
+  #         Ebs:
+  #           VolumeSize: '30'
+  #       # - DeviceName: "/dev/xvdcz"
+  #       #   Ebs:
+  #       #     VolumeSize: '30'
+  #     UserData:
+  #       Fn::Base64: !Sub |
+  #         #!/bin/bash
+  #         #====== Resize EBS
+  #           resize2fs /dev/xvda
+  #           # resize2fs /dev/xvdcz
+
+  #         #====== Install SSM
+  #           yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+  #           start amazon-ssm-agent
+  #           chkconfig amazon-ssm-agent on
+
+  #         #====== Install AWSLOGS
+  #           yum install -y awslogs
+  #           mv /etc/awslogs/awslogs.conf /etc/awslogs/awslogs.conf.bkp
+  #           aws s3 cp s3://${S3Bucket}/cloudformation/${TypeProject}/awslogs.conf /etc/awslogs/awslogs.conf
+  #           sed -i "s/us-east-1/${AWS::Region}/g" /etc/awslogs/awscli.conf
+  #           sed -i "s/clustername/${ECSCluster}/g" /etc/awslogs/awslogs.conf
+  #           sed -i "s/instanceID/`curl -s http://169.254.169.254/latest/meta-data/instance-id`/g" /etc/awslogs/awslogs.conf
+  #           service awslogs start
+  #           chkconfig awslogs on
+
+  #         echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+  #         echo ECS_INSTANCE_ATTRIBUTES={\"cluster_type\":\"worker\"} >> /etc/ecs/ecs.config
+
+  # WorkerAutoScalingGroup:
+  #   Type: AWS::AutoScaling::AutoScalingGroup
+  #   Properties:
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${ClusterName} cluster worker
+  #         PropagateAtLaunch: true
+  #     LaunchConfigurationName: !Ref WorkerLaunchConfiguration
+  #     MinSize: !Ref AsgServiceMinWorker
+  #     DesiredCapacity: !Ref AsgServiceDesiredWorker
+  #     MaxSize: !Ref AsgServiceMaxWorker
+  #     # TargetGroupARNs:
+  #     #   - 'Fn::ImportValue': !Sub ${ClusterName}BackendAlbDefaultTargetGroup
+  #     VPCZoneIdentifier:
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet1
+  #       - 'Fn::ImportValue': !Sub ${ClusterName}PrivateSubnet2
+  #   UpdatePolicy:
+  #     AutoScalingRollingUpdate:
+  #       MaxBatchSize: '1'
+  #       MinInstancesInService: !Ref AsgServiceDesiredWorker
+  #       PauseTime: 'PT5M'                  
+
+#========== Actions for Web ASG
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroupCP
+      Cooldown: !Ref WebScaleOutPolicyCooldown
+      ScalingAdjustment: 1
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroupCP
+      Cooldown: !Ref WebScaleInPolicyCooldown
+      ScalingAdjustment: -1
+
+#========== Actions for Worker ASG
+  # WorkerScaleOutPolicy:
+  #   Type: AWS::AutoScaling::ScalingPolicy
+  #   Properties:
+  #     AdjustmentType: ChangeInCapacity
+  #     AutoScalingGroupName: !Ref WorkerAutoScalingGroup
+  #     Cooldown: !Ref WorkerScaleOutPolicyCooldown
+  #     ScalingAdjustment: 1
+
+  # WorkerScaleInPolicy:
+  #   Type: AWS::AutoScaling::ScalingPolicy
+  #   Properties:
+  #     AdjustmentType: ChangeInCapacity
+  #     AutoScalingGroupName: !Ref WorkerAutoScalingGroup
+  #     Cooldown: !Ref WorkerScaleInPolicyCooldown
+  #     ScalingAdjustment: -1
+
+Outputs:
+  PrivateNameSpace:
+    Value: !Ref PrivateNameSpace
+    Export:
+      Name: !Sub ${ClusterName}PrivateNameSpace
+
+  PrivateNameSpaceName:
+    Value: !Sub ${ClusterName}.internal
+    Export:
+      Name: !Sub ${ClusterName}PrivateNameSpaceName
+
+  ScaleOutPolicy:
+    Value: !Ref ScaleOutPolicy
+    Export:
+      Name: !Sub ${ClusterName}ScaleOutPolicy
+
+  ScaleInPolicy:
+    Value: !Ref ScaleInPolicy
+    Export:
+      Name: !Sub ${ClusterName}ScaleInPolicy
+
+  BastionSecurityGroup:
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub ${ClusterName}BastionSecurityGroup
+
+  ECSRoleArn:
+    Value: !Sub ${ECSRole.Arn}
+    Export:
+      Name: !Sub ${ClusterName}ECSRoleArn
+
+  ECSCluster:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ClusterName}ECSCluster
+
+  ECSClusterArn:
+    Value: !Sub ${ECSCluster.Arn}
+    Export:
+      Name: !Sub ${ClusterName}ECSClusterArn
+
+  # AutoScalingGroup:
+  #   Value: !Ref AutoScalingGroup
+  #   Export:
+  #     Name: !Sub ${ClusterName}AutoScalingGroup
+
+  AutoScalingGroupCP:
+    Value: !Ref AutoScalingGroupCP
+    Export:
+      Name: !Sub ${ClusterName}AutoScalingGroupCP
+
+  # WorkerAutoScalingGroup:
+  #   Value: !Ref WorkerAutoScalingGroup
+  #   Export:
+  #     Name: !Sub ${ClusterName}AutoScalingGroupWorker
+
+  # WorkerScaleOutPolicy:
+  #   Value: !Ref WorkerScaleOutPolicy
+  #   Export:
+  #     Name: !Sub ${ClusterName}ScaleOutPolicyWorker
+
+  # WorkerScaleInPolicy:
+  #   Value: !Ref WorkerScaleInPolicy
+  #   Export:
+  #     Name: !Sub ${ClusterName}ScaleInPolicyWorker
